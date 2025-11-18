@@ -1,130 +1,100 @@
 # app.py
-import streamlit as st
-import pandas as pd
-import os
 import imaplib
 import email
 from email.header import decode_header
+import os
+import pandas as pd
+import streamlit as st
 
-# ---------------- Configuration ----------------
-EMAIL_USER = "your_email@gmail.com"
-EMAIL_PASS = "your_app_password"  # Use app password if Gmail
-IMAP_SERVER = "imap.gmail.com"
+# ---------------- Streamlit Page Config ----------------
+st.set_page_config(
+    page_title="Email Attachment Downloader",
+    page_icon="📩",
+    layout="wide"
+)
+
+st.title("📩 Email Attachment Downloader")
+st.markdown("""
+This app connects to your email, downloads attachments, and logs them in a CSV file.  
+Use **Gmail App Password** if using Gmail.
+""")
+
+# ---------------- Streamlit Secrets ----------------
+EMAIL_USER = st.secrets["EMAIL_USER"]
+EMAIL_PASS = st.secrets["EMAIL_PASS"]
+IMAP_SERVER = st.secrets.get("IMAP_SERVER", "imap.gmail.com")
+
+# ---------------- Settings ----------------
 SAVE_DIR = "attachments"
 LOG_FILE = "logs.csv"
 
+# Create folder if not exists
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# ---------------- Streamlit App ----------------
-st.set_page_config(page_title="Email Attachment Organizer", layout="wide")
-st.title("📧 Smart Email Attachment Organizer")
-
-st.markdown("""
-Fetch attachments from your inbox, track downloads, and visualize statistics.
-""")
-
-# --- Sidebar ---
-st.sidebar.header("Controls")
-run_fetch = st.sidebar.button("Fetch Latest Emails")
-file_types = st.sidebar.multiselect(
-    "Filter by File Type",
-    options=["All", "PDF", "Image", "Excel", "Other"],
-    default=["All"]
-)
-
-# Initialize logs CSV if not exists
+# Load existing logs or create new
 if not os.path.exists(LOG_FILE):
-    pd.DataFrame(columns=["Email_ID", "From", "Subject", "Attachment", "Saved_Path"]).to_csv(LOG_FILE, index=False)
+    logs_df = pd.DataFrame(columns=["Email_ID", "From", "Subject", "Attachment", "Saved_Path"])
+    logs_df.to_csv(LOG_FILE, index=False)
+else:
+    logs_df = pd.read_csv(LOG_FILE)
 
-logs = pd.read_csv(LOG_FILE)
-
-# ---------------- Fetch Emails Function ----------------
-def fetch_emails(last_n=20):
+# ---------------- Connect to Email ----------------
+st.info("Connecting to email server...")
+try:
     mail = imaplib.IMAP4_SSL(IMAP_SERVER)
     mail.login(EMAIL_USER, EMAIL_PASS)
     mail.select("inbox")
+    st.success("✅ Connected to email server")
+except Exception as e:
+    st.error(f"Failed to connect: {e}")
+    st.stop()
 
-    status, messages = mail.search(None, "ALL")
-    messages = messages[0].split()
+# ---------------- Fetch Emails ----------------
+st.info("Fetching latest emails...")
+status, messages = mail.search(None, "ALL")
+messages = messages[0].split()
 
-    new_logs = []
+if not messages:
+    st.warning("No emails found")
+    st.stop()
 
-    for msg_id in messages[-last_n:]:
-        status, msg_data = mail.fetch(msg_id, "(RFC822)")
-        for response_part in msg_data:
-            if isinstance(response_part, tuple):
-                msg = email.message_from_bytes(response_part[1])
-                subject = decode_header(msg["Subject"])[0][0]
-                if isinstance(subject, bytes):
-                    subject = subject.decode(errors="ignore")
-                from_ = msg.get("From")
+# Process last N emails
+N = st.sidebar.number_input("Number of latest emails to check", min_value=1, max_value=50, value=20)
+processed_count = 0
 
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        content_disposition = part.get("Content-Disposition")
-                        if content_disposition and "attachment" in content_disposition:
-                            filename = part.get_filename()
-                            if filename:
-                                filepath = os.path.join(SAVE_DIR, filename)
-                                with open(filepath, "wb") as f:
-                                    f.write(part.get_payload(decode=True))
-                                new_logs.append({
-                                    "Email_ID": msg_id.decode(),
-                                    "From": from_,
-                                    "Subject": subject,
-                                    "Attachment": filename,
-                                    "Saved_Path": filepath
-                                })
-    return new_logs
+for msg_id in messages[-N:]:
+    status, msg_data = mail.fetch(msg_id, "(RFC822)")
+    for response_part in msg_data:
+        if isinstance(response_part, tuple):
+            msg = email.message_from_bytes(response_part[1])
+            subject = decode_header(msg["Subject"])[0][0]
+            if isinstance(subject, bytes):
+                subject = subject.decode(errors="ignore")
+            from_ = msg.get("From")
 
-# ---------------- Run Fetch ----------------
-if run_fetch:
-    st.info("Fetching emails...")
-    new_entries = fetch_emails()
-    if new_entries:
-        logs = pd.concat([logs, pd.DataFrame(new_entries)], ignore_index=True)
-        logs.to_csv(LOG_FILE, index=False)
-        st.success(f"✅ Fetched {len(new_entries)} attachments")
-    else:
-        st.warning("No new attachments found.")
+            # Iterate through parts
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_disposition = part.get("Content-Disposition")
+                    if content_disposition and "attachment" in content_disposition:
+                        filename = part.get_filename()
+                        if filename:
+                            filepath = os.path.join(SAVE_DIR, filename)
+                            with open(filepath, "wb") as f:
+                                f.write(part.get_payload(decode=True))
+                            # Log attachment
+                            logs_df = pd.concat([logs_df, pd.DataFrame([{
+                                "Email_ID": msg_id.decode(),
+                                "From": from_,
+                                "Subject": subject,
+                                "Attachment": filename,
+                                "Saved_Path": filepath
+                            }])], ignore_index=True)
+                            processed_count += 1
 
-# ---------------- Apply Filters ----------------
-filtered_logs = logs.copy()
+# Save logs
+logs_df.to_csv(LOG_FILE, index=False)
 
-if "All" not in file_types:
-    ext_map = {
-        "PDF": ".pdf",
-        "Image": (".png", ".jpg", ".jpeg", ".gif"),
-        "Excel": (".xls", ".xlsx")
-    }
-    allowed_exts = []
-    for ft in file_types:
-        allowed_exts.extend(ext_map.get(ft, ()))
-    filtered_logs = filtered_logs[filtered_logs['Attachment'].str.lower().str.endswith(tuple(allowed_exts))]
-
-# ---------------- Tabs ----------------
-tab1, tab2, tab3 = st.tabs(["Latest Downloads", "Stats & Charts", "Download Logs"])
-
-# --- Tab 1: Latest Downloads ---
-with tab1:
-    st.subheader("Latest Attachments")
-    st.dataframe(filtered_logs.tail(20))
-
-# --- Tab 2: Stats & Charts ---
-with tab2:
-    st.subheader("Files by Sender")
-    st.bar_chart(filtered_logs['From'].value_counts())
-
-    st.subheader("Files by Type")
-    filtered_logs['File_Type'] = filtered_logs['Attachment'].apply(lambda x: os.path.splitext(x)[1])
-    st.bar_chart(filtered_logs['File_Type'].value_counts())
-
-# --- Tab 3: Download Logs ---
-with tab3:
-    st.subheader("Download Logs CSV")
-    st.download_button(
-        label="Download Logs",
-        data=filtered_logs.to_csv(index=False),
-        file_name="logs.csv",
-        mime="text/csv"
-    )
+st.success(f"✅ Finished processing {processed_count} attachments")
+st.write("### Logs")
+st.dataframe(logs_df.tail(20))
